@@ -427,7 +427,6 @@ async def main():
         await asyncio.gather(*tasks)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log("Shutting down...")
+    send_telegram_alert("🚀 A+ Strategy Bot is now LIVE on Render ✅")
+    threading.Thread(target=binance_liquidation_stream).start()
+    print("🚀 A+ Strategy Bot started... Monitoring:", SYMBOLS)

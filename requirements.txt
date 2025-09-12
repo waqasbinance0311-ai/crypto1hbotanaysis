@@ -1,3 +1,7 @@
 requests
-websocket-client
 aiohttp
+websocket-client
+websockets
+pandas
+numpy
+ta

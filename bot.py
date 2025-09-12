@@ -396,7 +396,7 @@ async def main():
         ]
         await asyncio.gather(*tasks)
 
-if _name_ == "_main_":
+if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:

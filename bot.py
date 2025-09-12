@@ -1,11 +1,11 @@
 """
-A+ LONG-only Futures Strategy Bot (Binance Futures)
+A+ LONG-only Futures Strategy Bot (Binance Futures) - FIXED startup & async issues
 - Multi-pair: BTC, ETH, SOL, XRP, BNB (configurable)
 - Real-time liquidation stream + ticker/trade stream
 - 1H SR detection (from minute closes), 15m entry confirmation
 - Liquidation spike filter, session filter (London/NY), single-alert policy
 - Sends Telegram alerts (pre-filled token/chat)
-- Save file, install deps, run: python a_plus_long_full_bot.py
+- Save file, install deps, run: python bot.py
 """
 
 import asyncio
@@ -67,7 +67,8 @@ def utc_now_str(): return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UT
 def utc_hour(): return datetime.now(timezone.utc).hour
 def log(*args):
     if PRINT_LOGS:
-        print(datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"), *args)
+        # use timezone-aware UTC now to avoid DeprecationWarning
+        print(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), *args)
 
 # -------------------------
 # Runtime state
@@ -85,10 +86,6 @@ daily_count_date = datetime.now(timezone.utc).date()
 # Support/Resistance detection
 # -------------------------
 def detect_sr_levels_from_closes(closes, local_window=SR_LOCAL_WINDOW, max_levels=SR_MAX_LEVELS):
-    """
-    Detect simple SR levels as local highs (RESIST) and local lows (SUPPORT).
-    Returns recent distinct levels [(kind, level), ...]
-    """
     levels = []
     arr = list(closes)
     n = len(arr)
@@ -101,7 +98,6 @@ def detect_sr_levels_from_closes(closes, local_window=SR_LOCAL_WINDOW, max_level
             levels.append(("RESIST", center))
         if center == min(window):
             levels.append(("SUPPORT", center))
-    # dedupe recent levels (keep distinct within ~0.2%)
     out = []
     seen = []
     for kind, lvl in reversed(levels):
@@ -155,7 +151,7 @@ def is_recent_liq_spike(symbol):
     return total >= LIQ_SPIKE_USD_THRESHOLD, total
 
 # -------------------------
-# Telegram send
+# Telegram send (async)
 # -------------------------
 async def send_telegram(session: aiohttp.ClientSession, text: str):
     if TELEGRAM_TOKEN.startswith("<") or TELEGRAM_CHAT_ID.startswith("<"):
@@ -176,7 +172,6 @@ async def send_telegram(session: aiohttp.ClientSession, text: str):
 # -------------------------
 def build_long_plan(symbol, price, support_level, liq_total):
     entry = float(price)
-    # SL just below support or small % below entry
     sl_candidate1 = support_level * 0.997
     sl_candidate2 = entry * 0.995
     sl = min(sl_candidate1, sl_candidate2)
@@ -184,10 +179,9 @@ def build_long_plan(symbol, price, support_level, liq_total):
         sl = entry * 0.995
     risk = entry - sl
     if risk <= 0:
-        risk = entry * 0.002  # fallback 0.2%
+        risk = entry * 0.002
         sl = entry - risk
     tp = entry + (risk * RR)
-    # rounding heuristics
     def r(v):
         if v >= 1:
             return round(v, 2)
@@ -207,7 +201,6 @@ def build_long_plan(symbol, price, support_level, liq_total):
 # -------------------------
 async def evaluate_symbol(symbol, http_session: aiohttp.ClientSession):
     global daily_count_date
-    # reset daily counts at UTC day boundary
     today = datetime.now(timezone.utc).date()
     if today != daily_count_date:
         daily_count.clear()
@@ -221,7 +214,6 @@ async def evaluate_symbol(symbol, http_session: aiohttp.ClientSession):
     if len(closes) < 30:
         return
 
-    # SR detect (we want SUPPORT for long)
     sr_levels = detect_sr_levels_from_closes(closes)
     if not sr_levels:
         return
@@ -229,27 +221,22 @@ async def evaluate_symbol(symbol, http_session: aiohttp.ClientSession):
     if not supports:
         return
 
-    # trends: 15m and 1h (1h approximated by last 60 minute closes)
     trend_15m = simple_trend_from_closes(closes[-15:], 15)
     trend_1h = simple_trend_from_closes(closes[-60:], 15) if len(closes) >= 60 else "FLAT"
     log(symbol, "trend_15m:", trend_15m, "trend_1h:", trend_1h)
-    # strict requirement: both UP
     if trend_15m != "UP" or trend_1h != "UP":
         return
 
-    # liquidation spike
     spike, liq_total = is_recent_liq_spike(symbol)
     if not spike:
         return
 
-    # current price and nearest support
     price = float(closes[-1])
     nearest_support = min(supports, key=lambda s: abs(s - price))
     if abs(price - nearest_support) / nearest_support > SR_PROX_PCT:
         log(symbol, "price not within SR proximity -> skip (price, support):", price, nearest_support)
         return
 
-    # cooldown & daily cap
     if now_ms() - last_alert_ts[symbol] < ALERT_COOLDOWN_SEC * 1000:
         log(symbol, "cooldown active -> skip")
         return
@@ -257,7 +244,6 @@ async def evaluate_symbol(symbol, http_session: aiohttp.ClientSession):
         log(symbol, "daily cap reached -> skip")
         return
 
-    # build plan & send alert
     plan = build_long_plan(symbol, price, nearest_support, liq_total)
     text = (
         f"📢 A+ LONG Alert (High Confidence)\n\n"
@@ -286,10 +272,6 @@ async def evaluate_symbol(symbol, http_session: aiohttp.ClientSession):
 # Binance listeners
 # -------------------------
 async def binance_liq_listener():
-    """
-    Connect to Binance Futures forced liquidation stream: '!forceOrder@arr' (all-symbols)
-    We collect liquidation USD amounts per symbol into recent_liqs.
-    """
     WS = f"{BINANCE_WS_BASE}/!forceOrder@arr"
     while True:
         try:
@@ -298,17 +280,14 @@ async def binance_liq_listener():
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
-                        # structure: {'data': [ ... ]}
                         data = msg.get("data") or msg
                         if isinstance(data, dict) and 'data' in data:
                             data = data['data']
-                        # sometimes data is array
                         if isinstance(data, list):
                             for e in data:
                                 sym = (e.get("s") or e.get("symbol") or "").upper()
                                 if not sym or sym not in SYMBOLS:
                                     continue
-                                # quantity and price may be nested
                                 qty = 0.0
                                 price = 0.0
                                 if isinstance(e.get("o"), dict):
@@ -321,7 +300,6 @@ async def binance_liq_listener():
                                 if usd > 0:
                                     push_liq(sym, usd)
                         elif isinstance(data, dict):
-                            # single event
                             e = data
                             sym = (e.get("s") or e.get("symbol") or "").upper()
                             if sym in SYMBOLS:
@@ -343,10 +321,6 @@ async def binance_liq_listener():
             await asyncio.sleep(2)
 
 async def binance_ticker_listener(trade_queue: asyncio.Queue):
-    """
-    Connect to Binance futures ticker all-stream '!ticker@arr' to build minute close.
-    This can be heavy; if needed later we can switch to per-symbol streams or REST candles.
-    """
     WS = f"{BINANCE_WS_BASE}/!ticker@arr"
     while True:
         try:
@@ -355,14 +329,12 @@ async def binance_ticker_listener(trade_queue: asyncio.Queue):
                 async for raw in ws:
                     try:
                         msg = json.loads(raw)
-                        # msg may be a dict with 's' and 'c' fields (symbol and close price)
                         if isinstance(msg, dict) and msg.get("s") and msg.get("c"):
                             sym = msg.get("s").upper()
                             if sym not in SYMBOLS:
                                 continue
                             price = float(msg.get("c") or 0.0)
                             await trade_queue.put((sym, price, now_ms()))
-                        # msg might be a list of tickers
                         elif isinstance(msg, list):
                             for t in msg:
                                 sym = t.get("s")
@@ -380,10 +352,6 @@ async def binance_ticker_listener(trade_queue: asyncio.Queue):
 # Minute aggregator from trade_queue
 # -------------------------
 async def minute_aggregator(trade_queue: asyncio.Queue, http_session):
-    """
-    Consume trade_queue and create minute closes for each symbol.
-    On minute rollover finalize minute close and evaluate symbol.
-    """
     last_minute = None
     minute_last_price = {s: None for s in SYMBOLS}
     while True:
@@ -396,15 +364,12 @@ async def minute_aggregator(trade_queue: asyncio.Queue, http_session):
             if last_minute is None:
                 last_minute = m
             if m != last_minute:
-                # finalize minute closes
                 for s in SYMBOLS:
                     p = minute_last_price.get(s)
                     if p is not None:
                         minute_closes[s].append(p)
-                # reset minute accumulator
                 minute_last_price = {s: None for s in SYMBOLS}
                 last_minute = m
-                # evaluate symbols concurrently
                 for s in SYMBOLS:
                     asyncio.create_task(evaluate_symbol(s, http_session))
         except Exception as e:
@@ -418,15 +383,21 @@ async def main():
     log("Starting A+ LONG-only Futures Bot (Binance) ...")
     trade_queue = asyncio.Queue()
     async with aiohttp.ClientSession() as http_sess:
+        # send startup message (async) so you get confirmation in Telegram
+        try:
+            await send_telegram(http_sess, "🚀 A+ Strategy Bot is now LIVE on Render ✅")
+        except Exception as e:
+            log("Startup telegram error:", e)
+
         tasks = [
             asyncio.create_task(binance_liq_listener()),
             asyncio.create_task(binance_ticker_listener(trade_queue)),
             asyncio.create_task(minute_aggregator(trade_queue, http_sess)),
         ]
-        # run forever
         await asyncio.gather(*tasks)
 
-if __name__ == "__main__":
-    send_telegram_alert("🚀 A+ Strategy Bot is now LIVE on Render ✅")
-    threading.Thread(target=binance_liquidation_stream).start()
-    print("🚀 A+ Strategy Bot started... Monitoring:", SYMBOLS)
+if _name_ == "_main_":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        log("Shutting down...")
